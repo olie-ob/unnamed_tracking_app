@@ -38,7 +38,15 @@ _STATUS = {
     "4": AnimeStatus.DROPPED,
     "6": AnimeStatus.WATCHLIST,
 }
-_FORMAT = {"tv": "TV", "movie": "MOVIE", "ova": "OVA", "ona": "ONA", "special": "SPECIAL", "music": "MUSIC"}
+# the same labels the AniList lookup stores, so a title reads the same whichever way it was added
+_FORMAT = {
+    "tv": "TV",
+    "movie": "Movie",
+    "ova": "OVA",
+    "ona": "ONA",
+    "special": "Special",
+    "music": "Music",
+}
 
 
 class MalImportError(ValueError):
@@ -97,7 +105,9 @@ def parse_mal_export(raw: bytes) -> list[MalEntry]:
     # entity declarations are how XML "bombs" are built, and a list export
     # never has any
     if b"<!DOCTYPE" in raw or b"<!ENTITY" in raw:
-        raise MalImportError("This XML has a document type declaration, which a MyAnimeList export never has.")
+        raise MalImportError(
+            "This XML has a document type declaration, which a MyAnimeList export never has."
+        )
     try:
         root = ET.fromstring(raw)
     except ET.ParseError as exc:

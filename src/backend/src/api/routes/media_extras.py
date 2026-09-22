@@ -26,8 +26,10 @@ from src.api.schemas.media_extras import (
 )
 from src.core.auth import get_current_user
 from src.core.preferences import load_preferences
+from src.core.titles import display_title
 from src.database.models.achievement import Achievement
 from src.database.models.anime import Anime, AnimeStatus
+from src.features.notifications import tracked_statuses
 from src.database.models.media_extras import (
     ActivityEventType,
     ActivityLog,
@@ -56,7 +58,7 @@ _STATUS_LABELS = {
 
 
 def status_change_detail(previous: Any, current: Any) -> str | None:
-    """"Plan to Watch → Watching" for the history feed, or None when the
+    """ "Plan to Watch → Watching" for the history feed, or None when the
     two stored statuses are the same thing to the user (Wishlist to
     Watchlist), which is not worth a history line."""
     before = _STATUS_LABELS.get(getattr(previous, "value", str(previous)), str(previous))
@@ -70,7 +72,9 @@ def status_change_detail(previous: Any, current: Any) -> str | None:
 _MAX_PROJECTED_PER_SHOW = 52
 
 
-def _calendar_entries_for_show(show: Any, media_type: str, window_end: int) -> list[dict]:
+def _calendar_entries_for_show(
+    show: Any, media_type: str, window_end: int, language: str = "english"
+) -> list[dict]:
     """The real next-episode entry (provider-confirmed), plus a weekly-
     cadence *guess* for every remaining episode up to the show's known
     episode_count — no provider hands over a full future schedule, only
@@ -80,9 +84,14 @@ def _calendar_entries_for_show(show: Any, media_type: str, window_end: int) -> l
     airing, since new seasons are added by hand as they're announced)."""
     entries = [
         {
-            "media_type": media_type, "media_id": show.id, "title": show.title,
-            "poster_url": show.poster_url, "next_episode_number": show.next_episode_number,
-            "air_at": show.next_episode_air_at, "kind": "episode", "is_projected": False,
+            "media_type": media_type,
+            "media_id": show.id,
+            "title": display_title(show, language),
+            "poster_url": show.poster_url,
+            "next_episode_number": show.next_episode_number,
+            "air_at": show.next_episode_air_at,
+            "kind": "episode",
+            "is_projected": False,
         }
     ]
     if not show.next_episode_number:
@@ -92,12 +101,13 @@ def _calendar_entries_for_show(show: Any, media_type: str, window_end: int) -> l
     # synced and routinely lags behind an ongoing show's real airing
     # count (a new episode gets scheduled — and next_episode_number
     # bumped — before the season's own total catches up). Only treat it
-    # as a real ceiling when it's still ahead of the confirmed next
-    # episode; otherwise there's no known end, so keep projecting up to
-    # the window/safety-cap limits instead of silently stopping at one.
+    # as a real ceiling when it reaches the confirmed next episode (a count
+    # equal to it means that episode is the last one); below it there's
+    # no known end, so keep projecting up to the window/safety-cap limits
+    # instead of silently stopping at one.
     total = (
         season.episode_count
-        if season and season.episode_count and season.episode_count > show.next_episode_number
+        if season and season.episode_count and season.episode_count >= show.next_episode_number
         else None
     )
     interval_seconds = (show.airing_interval_days or 7) * 24 * 60 * 60
@@ -109,9 +119,14 @@ def _calendar_entries_for_show(show: Any, media_type: str, window_end: int) -> l
             break
         entries.append(
             {
-                "media_type": media_type, "media_id": show.id, "title": show.title,
-                "poster_url": show.poster_url, "next_episode_number": n,
-                "air_at": air_at, "kind": "episode", "is_projected": True,
+                "media_type": media_type,
+                "media_id": show.id,
+                "title": display_title(show, language),
+                "poster_url": show.poster_url,
+                "next_episode_number": n,
+                "air_at": air_at,
+                "kind": "episode",
+                "is_projected": True,
             }
         )
         projected += 1
@@ -128,7 +143,10 @@ def _date_to_unix(d: date | None) -> int:
     # day for anyone west of UTC. Noon keeps the calendar date correct
     # for every real-world timezone (UTC-11 through UTC+12).
     assert d is not None
-    return int(datetime.combine(d, datetime.min.time(), tzinfo=timezone.utc).timestamp()) + 12 * 3600
+    return (
+        int(datetime.combine(d, datetime.min.time(), tzinfo=timezone.utc).timestamp()) + 12 * 3600
+    )
+
 
 router = APIRouter(prefix="/api", tags=["media-extras"], dependencies=[Depends(get_current_user)])
 
@@ -138,12 +156,18 @@ _MODEL_BY_TYPE: dict[str, Any] = {"movie": Movie, "tv": TVShow, "anime": Anime}
 async def _resolve_media(media_type: str, media_id: UUID, user_id: UUID, db: AsyncSession) -> Any:
     model = _MODEL_BY_TYPE.get(media_type)
     if model is None:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid media_type {media_type!r}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid media_type {media_type!r}"
+        )
     row = await db.scalar(
-        select(model).where(model.id == media_id, model.user_id == user_id, model.deleted_at.is_(None))
+        select(model).where(
+            model.id == media_id, model.user_id == user_id, model.deleted_at.is_(None)
+        )
     )
     if row is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"{media_type} {media_id} not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"{media_type} {media_id} not found"
+        )
     return row
 
 
@@ -210,8 +234,13 @@ async def create_rewatch(
     db.add(log)
     media.rewatches = (media.rewatches or 0) + 1
     await log_activity(
-        db, current_user.id, payload.media_type, payload.media_id, media.title,
-        ActivityEventType.REWATCHED, finished_on,
+        db,
+        current_user.id,
+        payload.media_type,
+        payload.media_id,
+        media.title,
+        ActivityEventType.REWATCHED,
+        finished_on,
     )
     await db.commit()
     await db.refresh(log)
@@ -227,20 +256,26 @@ async def list_rewatches(
 ) -> list[RewatchLog]:
     await _resolve_media(media_type, media_id, current_user.id, db)
     rows = (
-        await db.execute(
-            select(RewatchLog)
-            .where(
-                RewatchLog.user_id == current_user.id,
-                RewatchLog.media_type == media_type,
-                RewatchLog.media_id == media_id,
+        (
+            await db.execute(
+                select(RewatchLog)
+                .where(
+                    RewatchLog.user_id == current_user.id,
+                    RewatchLog.media_type == media_type,
+                    RewatchLog.media_id == media_id,
+                )
+                .order_by(RewatchLog.finished_on.desc())
             )
-            .order_by(RewatchLog.finished_on.desc())
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     return list(rows)
 
 
-@router.delete("/rewatches/{rewatch_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
+@router.delete(
+    "/rewatches/{rewatch_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None
+)
 async def delete_rewatch(
     rewatch_id: UUID,
     db: AsyncSession = Depends(get_db),
@@ -250,12 +285,28 @@ async def delete_rewatch(
         select(RewatchLog).where(RewatchLog.id == rewatch_id, RewatchLog.user_id == current_user.id)
     )
     if log is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Rewatch {rewatch_id} not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"Rewatch {rewatch_id} not found"
+        )
     media = await _resolve_media(log.media_type, log.media_id, current_user.id, db)
     media.rewatches = max(0, (media.rewatches or 0) - 1)
+    # the History line for that day counted this rewatch too
+    day = await db.scalar(
+        select(ActivityLog).where(
+            ActivityLog.user_id == current_user.id,
+            ActivityLog.media_type == log.media_type,
+            ActivityLog.media_id == log.media_id,
+            ActivityLog.event_type == ActivityEventType.REWATCHED,
+            ActivityLog.event_date == log.finished_on,
+        )
+    )
+    if day is not None:
+        if day.count <= 1:
+            await db.delete(day)
+        else:
+            day.count -= 1
     await db.delete(log)
     await db.commit()
-
 
 
 @router.get("/activity", response_model=list[ActivityEntryRead])
@@ -266,12 +317,16 @@ async def get_activity(
 ) -> list:
     since = date.today() - timedelta(days=days)
     rows = (
-        await db.execute(
-            select(ActivityLog)
-            .where(ActivityLog.user_id == current_user.id, ActivityLog.event_date >= since)
-            .order_by(ActivityLog.event_date.desc())
+        (
+            await db.execute(
+                select(ActivityLog)
+                .where(ActivityLog.user_id == current_user.id, ActivityLog.event_date >= since)
+                .order_by(ActivityLog.event_date.desc())
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     return list(rows)
 
 
@@ -287,9 +342,15 @@ async def create_activity_entry(
     `log_activity` already uses for automatic entries."""
     media = await _resolve_media(payload.media_type, payload.media_id, current_user.id, db)
     await log_activity(
-        db, current_user.id, payload.media_type, payload.media_id, media.title,
-        ActivityEventType(payload.event_type), payload.event_date,
-        increment=payload.count, detail=payload.detail,
+        db,
+        current_user.id,
+        payload.media_type,
+        payload.media_id,
+        media.title,
+        ActivityEventType(payload.event_type),
+        payload.event_date,
+        increment=payload.count,
+        detail=payload.detail,
     )
     await db.commit()
     row = await db.scalar(
@@ -318,10 +379,14 @@ async def update_activity_entry(
     unique constraint, same "one line per bucket" rule log_activity
     already enforces for automatic entries."""
     entry = await db.scalar(
-        select(ActivityLog).where(ActivityLog.id == entry_id, ActivityLog.user_id == current_user.id)
+        select(ActivityLog).where(
+            ActivityLog.id == entry_id, ActivityLog.user_id == current_user.id
+        )
     )
     if entry is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Activity entry {entry_id} not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"Activity entry {entry_id} not found"
+        )
 
     updates = payload.model_dump(exclude_unset=True)
     key_changed = any(f in updates for f in ("media_type", "media_id", "event_type", "event_date"))
@@ -367,10 +432,14 @@ async def delete_activity_entry(
     current_user: User = Depends(get_current_user),
 ) -> None:
     entry = await db.scalar(
-        select(ActivityLog).where(ActivityLog.id == entry_id, ActivityLog.user_id == current_user.id)
+        select(ActivityLog).where(
+            ActivityLog.id == entry_id, ActivityLog.user_id == current_user.id
+        )
     )
     if entry is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Activity entry {entry_id} not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"Activity entry {entry_id} not found"
+        )
     await db.delete(entry)
     await db.commit()
 
@@ -387,6 +456,9 @@ async def build_calendar_entries(
     started yet. `days` windows both directions loosely — something that
     just aired/released stays visible for a day so "today" doesn't look
     empty the moment it passes."""
+    prefs = await load_preferences(db, user_id)
+    language = str(prefs["title_language"])
+    airing = prefs["calendar_airing_statuses"]
     now = int(time.time())
     window_end = now + days * 86400
     window_start = now - 86400
@@ -395,109 +467,160 @@ async def build_calendar_entries(
     date_window_start = today - timedelta(days=1)
 
     result: list[dict] = []
+
     anime_rows = (
-        await db.execute(
-            select(Anime).where(
-                Anime.user_id == user_id,
-                Anime.deleted_at.is_(None),
-                Anime.next_episode_air_at.isnot(None),
-                Anime.next_episode_air_at >= window_start,
-                Anime.next_episode_air_at <= window_end,
+        (
+            await db.execute(
+                select(Anime).where(
+                    Anime.user_id == user_id,
+                    Anime.deleted_at.is_(None),
+                    Anime.status.in_(tracked_statuses(AnimeStatus, airing)),
+                    Anime.next_episode_air_at.isnot(None),
+                    Anime.next_episode_air_at >= window_start,
+                    Anime.next_episode_air_at <= window_end,
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
+
     for a in anime_rows:
-        result.extend(_calendar_entries_for_show(a, "anime", window_end))
+        result.extend(_calendar_entries_for_show(a, "anime", window_end, language))
+
     tv_rows = (
-        await db.execute(
-            select(TVShow).where(
-                TVShow.user_id == user_id,
-                TVShow.deleted_at.is_(None),
-                TVShow.next_episode_air_at.isnot(None),
-                TVShow.next_episode_air_at >= window_start,
-                TVShow.next_episode_air_at <= window_end,
+        (
+            await db.execute(
+                select(TVShow).where(
+                    TVShow.user_id == user_id,
+                    TVShow.deleted_at.is_(None),
+                    TVShow.status.in_(tracked_statuses(TVShowStatus, airing)),
+                    TVShow.next_episode_air_at.isnot(None),
+                    TVShow.next_episode_air_at >= window_start,
+                    TVShow.next_episode_air_at <= window_end,
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
+
     for t in tv_rows:
-        result.extend(_calendar_entries_for_show(t, "tv", window_end))
+        result.extend(_calendar_entries_for_show(t, "tv", window_end, language))
 
     movie_rows = (
-        await db.execute(
-            select(Movie).where(
-                Movie.user_id == user_id,
-                Movie.deleted_at.is_(None),
-                Movie.status.in_([MovieStatus.WISHLIST, MovieStatus.WATCHLIST]),
-                Movie.release_date.isnot(None),
-                Movie.release_date >= date_window_start,
-                Movie.release_date <= date_window_end,
+        (
+            await db.execute(
+                select(Movie).where(
+                    Movie.user_id == user_id,
+                    Movie.deleted_at.is_(None),
+                    Movie.status.in_([MovieStatus.WISHLIST, MovieStatus.WATCHLIST]),
+                    Movie.release_date.isnot(None),
+                    Movie.release_date >= date_window_start,
+                    Movie.release_date <= date_window_end,
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     for m in movie_rows:
         result.append(
             {
-                "media_type": "movie", "media_id": m.id, "title": m.title, "poster_url": m.poster_url,
-                "next_episode_number": None, "air_at": _date_to_unix(m.release_date), "kind": "release",
+                "media_type": "movie",
+                "media_id": m.id,
+                "title": m.title,
+                "poster_url": m.poster_url,
+                "next_episode_number": None,
+                "air_at": _date_to_unix(m.release_date),
+                "kind": "release",
             }
         )
     upcoming_tv_rows = (
-        await db.execute(
-            select(TVShow).where(
-                TVShow.user_id == user_id,
-                TVShow.deleted_at.is_(None),
-                TVShow.status.in_([TVShowStatus.WISHLIST, TVShowStatus.WATCHLIST]),
-                TVShow.first_air_date.isnot(None),
-                TVShow.first_air_date >= date_window_start,
-                TVShow.first_air_date <= date_window_end,
+        (
+            await db.execute(
+                select(TVShow).where(
+                    TVShow.user_id == user_id,
+                    TVShow.deleted_at.is_(None),
+                    TVShow.status.in_([TVShowStatus.WISHLIST, TVShowStatus.WATCHLIST]),
+                    TVShow.first_air_date.isnot(None),
+                    TVShow.first_air_date >= date_window_start,
+                    TVShow.first_air_date <= date_window_end,
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     for t in upcoming_tv_rows:
         result.append(
             {
-                "media_type": "tv", "media_id": t.id, "title": t.title, "poster_url": t.poster_url,
-                "next_episode_number": None, "air_at": _date_to_unix(t.first_air_date), "kind": "release",
+                "media_type": "tv",
+                "media_id": t.id,
+                "title": t.title,
+                "poster_url": t.poster_url,
+                "next_episode_number": None,
+                "air_at": _date_to_unix(t.first_air_date),
+                "kind": "release",
             }
         )
     upcoming_anime_rows = (
-        await db.execute(
-            select(Anime).where(
-                Anime.user_id == user_id,
-                Anime.deleted_at.is_(None),
-                Anime.status.in_([AnimeStatus.WISHLIST, AnimeStatus.WATCHLIST]),
-                Anime.first_air_date.isnot(None),
-                Anime.first_air_date >= date_window_start,
-                Anime.first_air_date <= date_window_end,
+        (
+            await db.execute(
+                select(Anime).where(
+                    Anime.user_id == user_id,
+                    Anime.deleted_at.is_(None),
+                    Anime.status.in_([AnimeStatus.WISHLIST, AnimeStatus.WATCHLIST]),
+                    Anime.first_air_date.isnot(None),
+                    Anime.first_air_date >= date_window_start,
+                    Anime.first_air_date <= date_window_end,
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     for a in upcoming_anime_rows:
         result.append(
             {
-                "media_type": "anime", "media_id": a.id, "title": a.title, "poster_url": a.poster_url,
-                "next_episode_number": None, "air_at": _date_to_unix(a.first_air_date), "kind": "release",
+                "media_type": "anime",
+                "media_id": a.id,
+                "title": a.title,
+                "poster_url": a.poster_url,
+                "next_episode_number": None,
+                "air_at": _date_to_unix(a.first_air_date),
+                "kind": "release",
             }
         )
 
     if game_releases:
         game_rows = (
-            await db.execute(
-                select(Game).where(
-                    Game.user_id == user_id,
-                    Game.deleted_at.is_(None),
-                    Game.status.in_([GameStatus.WISHLIST, GameStatus.BACKLOG]),
-                    Game.release_date.isnot(None),
-                    Game.release_date >= date_window_start,
-                    Game.release_date <= date_window_end,
+            (
+                await db.execute(
+                    select(Game).where(
+                        Game.user_id == user_id,
+                        Game.deleted_at.is_(None),
+                        Game.status.in_([GameStatus.WISHLIST, GameStatus.BACKLOG]),
+                        Game.release_date.isnot(None),
+                        Game.release_date >= date_window_start,
+                        Game.release_date <= date_window_end,
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
+
         for g in game_rows:
             result.append(
                 {
-                    "media_type": "game", "media_id": g.id, "title": g.title, "poster_url": None,
-                    "next_episode_number": None, "air_at": _date_to_unix(g.release_date), "kind": "release",
+                    "media_type": "game",
+                    "media_id": g.id,
+                    "title": g.title,
+                    "poster_url": f"/api/game/{g.id}/assets/key_art",
+                    "next_episode_number": None,
+                    "air_at": _date_to_unix(g.release_date),
+                    "kind": "release",
                 }
             )
 
@@ -526,32 +649,102 @@ async def get_calendar_games(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> list[dict]:
-    """Games history for the calendar: the day a game was completed and
-    how many achievements were unlocked on a day. Empty unless the user
-    turned "Games history" on in Settings."""
+    """The past side of Games on the calendar. With "Game releases" on, the
+    release date of every game in the library from before yesterday (the
+    calendar's own feed carries today and everything ahead). With "Games
+    history" on, the day each game was finished and bought and how many
+    achievements were unlocked on a day. Empty when Games are hidden."""
     prefs = await load_preferences(db, current_user.id)
-    if not prefs["calendar_game_history"] or prefs["calendar_hide_games"]:
+    if prefs["calendar_hide_games"]:
         return []
-    since = int(time.time()) - days * 86400
     entries: list[dict] = []
+    if prefs["calendar_game_releases"]:
+        released = (
+            (
+                await db.execute(
+                    select(Game).where(
+                        Game.user_id == current_user.id,
+                        Game.deleted_at.is_(None),
+                        Game.release_date.isnot(None),
+                        Game.release_date < date.today() - timedelta(days=1),
+                        Game.release_date >= date.today() - timedelta(days=days),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for g in released:
+            if g.release_date is None:
+                continue
+            entries.append(
+                {
+                    "kind": "game_released",
+                    "game_id": g.id,
+                    "title": g.title,
+                    "date": g.release_date.isoformat(),
+                    "count": 1,
+                    "poster_url": f"/api/game/{g.id}/assets/key_art",
+                }
+            )
+    if not prefs["calendar_game_history"]:
+        entries.sort(key=lambda e: e["date"])
+        return entries
+    since = int(time.time()) - days * 86400
     finished = (
-        await db.execute(
-            select(Game).where(
-                Game.user_id == current_user.id,
-                Game.deleted_at.is_(None),
-                Game.completion_date.isnot(None),
-                Game.completion_date >= since,
+        (
+            await db.execute(
+                select(Game).where(
+                    Game.user_id == current_user.id,
+                    Game.deleted_at.is_(None),
+                    Game.completion_date.isnot(None),
+                    Game.completion_date >= since,
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     for g in finished:
         if g.completion_date is None:
             continue
         entries.append(
             {
-                "kind": "game_finished", "game_id": g.id, "title": g.title,
-                "date": datetime.fromtimestamp(g.completion_date, tz=timezone.utc).date().isoformat(),
+                "kind": "game_finished",
+                "game_id": g.id,
+                "title": g.title,
+                "date": datetime.fromtimestamp(g.completion_date, tz=timezone.utc)
+                .date()
+                .isoformat(),
                 "count": 1,
+                "poster_url": f"/api/game/{g.id}/assets/key_art",
+            }
+        )
+    bought = (
+        (
+            await db.execute(
+                select(Game).where(
+                    Game.user_id == current_user.id,
+                    Game.deleted_at.is_(None),
+                    Game.purchase_date.isnot(None),
+                    Game.purchase_date >= since,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for g in bought:
+        if g.purchase_date is None:
+            continue
+        entries.append(
+            {
+                "kind": "game_purchased",
+                "game_id": g.id,
+                "title": g.title,
+                "date": datetime.fromtimestamp(g.purchase_date, tz=timezone.utc).date().isoformat(),
+                "count": 1,
+                "poster_url": f"/api/game/{g.id}/assets/key_art",
             }
         )
     day = func.date(func.to_timestamp(Achievement.unlocked_at))
@@ -571,7 +764,14 @@ async def get_calendar_games(
     ).all()
     for game_id, title, d, count in rows:
         entries.append(
-            {"kind": "game_achievements", "game_id": game_id, "title": title, "date": d.isoformat(), "count": count}
+            {
+                "kind": "game_achievements",
+                "game_id": game_id,
+                "title": title,
+                "date": d.isoformat(),
+                "count": count,
+                "poster_url": f"/api/game/{game_id}/assets/key_art",
+            }
         )
     entries.sort(key=lambda e: e["date"])
     return entries

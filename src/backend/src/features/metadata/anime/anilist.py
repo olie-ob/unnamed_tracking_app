@@ -136,6 +136,7 @@ def _format_label(raw: str | None) -> str | None:
         return None
     return _FORMAT_LABELS.get(raw, raw.title())
 
+
 # Up to 50 entries by MyAnimeList id in one request, so filling in a whole
 # imported list takes a handful of calls instead of one per title.
 _BY_MAL_IDS_QUERY = f"""
@@ -155,6 +156,21 @@ query ($ids: [Int], $perPage: Int) {{
     }}
   }}
 }}
+"""
+_TOTALS_QUERY = """
+query ($ids: [Int], $perPage: Int) {
+  Page(page: 1, perPage: $perPage) {
+    media(id_in: $ids, type: ANIME) {
+      id
+      episodes
+      status
+      nextAiringEpisode {
+        episode
+        airingAt
+      }
+    }
+  }
+}
 """
 _BATCH_SIZE = 50
 
@@ -257,7 +273,9 @@ query ($id: Int) {
 _EPISODE_TITLE_RE = re.compile(r"^Episode\s+\d+\s*-\s*(.+)$", re.IGNORECASE)
 
 
-def _blank_episode(episode_number: int, still_url: str | None = None, title: str | None = None) -> dict[str, Any]:
+def _blank_episode(
+    episode_number: int, still_url: str | None = None, title: str | None = None
+) -> dict[str, Any]:
     return {
         "episode_number": episode_number,
         "title": title,
@@ -311,6 +329,7 @@ def _pad_to_aired_total(results: list[dict[str, Any]], aired_total: int | None) 
         if n not in known:
             results.append(_blank_episode(n))
     results.sort(key=lambda r: r["episode_number"])
+
 
 _RELATIONS_QUERY = """
 query ($search: String) {
@@ -626,7 +645,9 @@ class AniListClient:
             return None
         return _map_media_entry(media)
 
-    def _batched(self, query: str, ids: list[int], key: str) -> tuple[dict[int, dict[str, Any]], int]:
+    def _batched(
+        self, query: str, ids: list[int], key: str
+    ) -> tuple[dict[int, dict[str, Any]], int]:
         found: dict[int, dict[str, Any]] = {}
         failed = 0
         for start in range(0, len(ids), _BATCH_SIZE):
@@ -649,6 +670,42 @@ class AniListClient:
         limit or outage), so a caller can say so instead of pretending they
         were looked up."""
         return self._batched(_BY_MAL_IDS_QUERY, mal_ids, "id_mal")
+
+    def final_totals(self, anilist_ids: list[int]) -> dict[int, dict[str, Any]]:
+        """For many AniList ids at once: {id: {"total", "planned", "next", "status"}}.
+        `total` is the entry's own episode count and only when it has finished
+        airing (an airing or cancelled entry's count is a plan, not a fact),
+        so it can safely be used to trim episodes some provider attached from
+        another entry. `planned` is the count an airing entry announces and
+        `next` the number of its next episode and `air_at` when it airs;
+        `episodes` is the raw count AniList holds. A batch that fails is
+        simply absent from the result."""
+        out: dict[int, dict[str, Any]] = {}
+        for start in range(0, len(anilist_ids), _BATCH_SIZE):
+            chunk = anilist_ids[start : start + _BATCH_SIZE]
+            try:
+                payload = self._post_graphql(_TOTALS_QUERY, {"ids": chunk, "perPage": _BATCH_SIZE})
+            except AniListError:
+                continue
+            for media in ((payload.get("data") or {}).get("Page") or {}).get("media") or []:
+                episodes = media.get("episodes")
+                finished = (
+                    media.get("status") == "FINISHED" and isinstance(episodes, int) and episodes > 0
+                )
+                next_airing = media.get("nextAiringEpisode") or {}
+                upcoming = next_airing.get("episode")
+                out[int(media["id"])] = {
+                    "total": episodes if finished else None,
+                    # what an airing entry says it will have, when it says
+                    "planned": episodes
+                    if isinstance(episodes, int) and episodes > 0 and not finished
+                    else None,
+                    "next": upcoming if isinstance(upcoming, int) else None,
+                    "air_at": next_airing.get("airingAt"),
+                    "episodes": episodes if isinstance(episodes, int) else None,
+                    "status": media.get("status"),
+                }
+        return out
 
     def get_by_ids(self, anilist_ids: list[int]) -> tuple[dict[int, dict[str, Any]], int]:
         """Same as `get_by_mal_ids`, keyed by AniList's own id."""
@@ -681,9 +738,7 @@ class AniListClient:
         _pad_to_aired_total(results, _aired_total(media))
         return results
 
-    def airing_status(
-        self, anilist_id: str
-    ) -> tuple[int | None, bool, int | None, int | None]:
+    def airing_status(self, anilist_id: str) -> tuple[int | None, bool, int | None, int | None]:
         """`(aired_episode_count, is_airing, next_episode_air_at,
         next_episode_number)` — the same fields `episodes()` uses to
         compute a total, without the `streamingEpisodes` list, so this is
@@ -733,9 +788,7 @@ class AniListClient:
             current_id = anchor_id
             for _ in range(_MAX_CHAIN_HOPS):
                 edges = (nodes[current_id].get("relations") or {}).get("edges") or []
-                edge = next(
-                    (e for e in edges if e.get("relationType") == relation_type), None
-                )
+                edge = next((e for e in edges if e.get("relationType") == relation_type), None)
                 if not edge or not edge.get("node"):
                     break
                 next_id = edge["node"]["id"]
@@ -799,9 +852,7 @@ class AniListClient:
                 continue
             recommendations.append(_node_to_dict(node))
 
-        branches = self._order_related_branches(
-            _collect_branches(nodes, anchor["id"], chain_ids)
-        )
+        branches = self._order_related_branches(_collect_branches(nodes, anchor["id"], chain_ids))
         seen_ids = set(chain_ids) | {b["id"] for b in branches}
         branches.extend(self._expand_branch_chains(branches, seen_ids))
         for b in branches:
@@ -930,9 +981,7 @@ class AniListClient:
                     prequel_of[b["id"]] = target
         return prequel_of
 
-    def _order_related_branches(
-        self, branches: list[dict[str, Any]]
-    ) -> list[dict[str, Any]]:
+    def _order_related_branches(self, branches: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """A branch group sharing the same anchor and relation label —
         e.g. a two-part movie duology, both tagged ALTERNATIVE to the
         parent show rather than SEQUEL/PREQUEL to it — can still be
